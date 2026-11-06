@@ -1,0 +1,19 @@
+# Quartus
+quartus/db/
+quartus/incremental_db/
+quartus/output_files/
+quartus/*.qws
+quartus/*.rpt
+quartus/*.summary
+quartus/*.smsg
+quartus/greybox_tmp/
+*.bak
+# ModelSim / Questa
+sim/work/
+sim/transcript
+*.wlf
+*.vcd
+*.vstf
+modelsim.ini
+# Icarus
+*.out
