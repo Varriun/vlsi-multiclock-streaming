@@ -17,3 +17,5 @@ sim/transcript
 modelsim.ini
 # Icarus
 *.out
+# Regression output
+build/

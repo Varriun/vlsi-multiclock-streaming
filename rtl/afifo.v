@@ -88,7 +88,7 @@ module afifo #(
         end
     end
     assign wfull = ({~wptr_gray[PTR_W-1],
-                     wptr_gray[PTR_W-2],
+                     ~wptr_gray[PTR_W-2],
                      wptr_gray[PTR_W-3:0]}   // lower (PTR_W-2) bits unchanged
                      == rptr_sync2_w);
     

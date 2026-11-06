@@ -26,7 +26,7 @@ vlog +define+SIMULATION ../rtl/my_sys.v ../rtl/fir.v ../rtl/afifo.v ../rtl/uart.
 
 # 4. Load the top-level testbench (-voptargs=+acc keeps all signals visible
 #    so they get recorded into the VCD)
-vsim -voptargs=+acc work.my_sys_tb
+vsim -voptargs=+acc work.my_sys_tb +vcd
 
 # 5. Run until the testbench finishes ($finish)
 run -all

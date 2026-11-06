@@ -47,6 +47,7 @@ module my_sys_tb;
     reg        in_valid;
     reg  [7:0] data_in;
     wire       tx;
+    wire       tx_busy;
 
     // dut instantiation
     my_sys dut (
@@ -55,7 +56,8 @@ module my_sys_tb;
         .rst_n    (rst_n),
         .in_valid (in_valid),
         .data_in  (data_in),
-        .tx       (tx)
+        .tx       (tx),
+        .tx_busy  (tx_busy)
     );
 
     // clock generation
@@ -70,26 +72,99 @@ module my_sys_tb;
     always  #50 slow_clk = ~slow_clk;   // 10 MHz: 50 ns half-period
 
     // vcd dump  — required by the project spec
-    // $dumpvars(0, my_sys_tb) means: dump ALL variables in my_sys_tb and
-    // every module it instantiates (recursively, depth=0 means all levels).
-    // The VCD file will be large (~tens of MB for a 32 ms simulation).
+    // $dumpvars(0, dut) dumps the DUT and everything below it (depth 0 = all
+    // levels). TB-only variables (e.g. the activity counters, which change
+    // every cycle) are left out: they bloat the file and Quartus power
+    // analysis only uses design nets. All DUT ports are still visible.
+    // The VCD file is large (~100 MB for a 32 ms simulation), so it is only
+    // written when the run is started with the +vcd plusarg
+    // (the ModelSim .do scripts pass it; run_tests.sh does not).
     initial begin
-        $dumpfile("simulation_dump.vcd");
-        $dumpvars(0, my_sys_tb);
+        if ($test$plusargs("vcd")) begin
+            $dumpfile("simulation_dump.vcd");
+            $dumpvars(0, dut);
+        end
     end
+
+    // clock-gating switch: +nogating forces the gate permanently open
+    // (same effect as the force in sim/run_sim_nogating.do).
+    initial begin
+        if ($test$plusargs("nogating")) begin
+            force dut.clk_en = 1'b1;
+            $display(" +nogating: clk_en forced to 1 (clock gating disabled)");
+        end
+    end
+
+    // switching-activity counters (power proxy, no Quartus needed)
+    // Dynamic power ~ toggle rate, and the clock net toggles every cycle,
+    // so counting gated_clk rising edges vs raw fast_clk rising edges after
+    // reset shows how much clock activity the gating removes.
+    integer fast_edges  = 0;
+    integer gated_edges = 0;
+    always @(posedge fast_clk)      if (rst_n) fast_edges  = fast_edges  + 1;
+    always @(posedge dut.gated_clk) if (rst_n) gated_edges = gated_edges + 1;
+
+    task print_activity;
+        begin
+            $display("ACTIVITY: fast_clk edges = %0d  gated_clk edges = %0d  (%0.4f%% of fast_clk)",
+                     fast_edges, gated_edges,
+                     (fast_edges > 0) ? (100.0 * gated_edges) / fast_edges : 0.0);
+        end
+    endtask
 
     // tx serial output monitor
     // watches the tx line and prints a message on every edge.
     // this lets you verify 9600-baud framing in the transcript.
-    //
-    // note: At 9600 baud, one bit = 1/9600 s ≈ 104,167 ns.
-    // each edge message should be spaced by ~104,167 ns (or multiples).
+
+    // note: The nominal rate is 9600 baud.
+    // The actual time of the slow_clk is 1042 cycles, which is roughly 104,200ns.
+    // So edges are spaced by multiples of 104,200 ns. 
+    // The baud rate is closer to 9596.9 baud, which is around the 0.03% error.
     initial begin
+        $timeformat(-9,0," ns",0);
         $display(" my_sys_tb: simulation start");
         $display(" fast_clk: 100 MHz   slow_clk: 10 MHz   baud: 9600");
         forever begin
             @(tx);   // wait for any change on tx
-            $display("[%0t ns]  tx edge → %b", $time, tx);
+            $display("[%t]  tx edge → %b", $time, tx);
+        end
+    end
+
+    // UART receiver model (testbench only)
+    localparam integer BIT_NS = 1042 * 100;   // one bit-time in ns
+
+    reg [15:0] rx_word;
+    integer    b;
+
+    initial begin
+        forever begin
+            // 1. wait for the start of a frame: tx goes from 1 to 0
+            //    (hint: the same @(...) style as the tx monitor, but one edge type only)
+            @(negedge tx);    
+            // 2. wait half a bit, so you sample in the MIDDLE of each bit
+            #(BIT_NS/2);
+            // 3. check tx is still 0 there; if not, it was a glitch:
+            //    print a warning (and 'disable' or just carry on, your call)
+            if(tx) begin 
+                $display("[%t] Warning: tx is still on low", $time);
+            end
+            // 4. loop b = 0..15:
+            //       wait one full bit
+            //       store tx into rx_word[b]        (LSB arrives first)
+            for (b = 0; b < 16; b = b + 1) begin
+                // wait one full bit   ← same kind of line as your step 5 delay
+                #(BIT_NS);
+                // rx_word[b] = ...    ← what's on the wire right now?
+                rx_word[b] = tx; 
+            end
+
+            // 5. wait one more bit and check the stop bit is 1; warn if not
+            #(BIT_NS);
+            if(tx==0) begin
+                $display("[%t] Warning: stop bit is not 1", $time);
+            end
+            // 6. print rx_word in hex, with the time
+            $display("[%t] Displayed message %h",$time, rx_word);
         end
     end
 
@@ -127,7 +202,7 @@ module my_sys_tb;
         #2;   // small skew so stimulus change is not coincident with a clock edge
 
         rst_n = 1'b1;
-        $display("[%0t ns] ── test 1 done: reset released ──", $time);
+        $display("[%t] ── test 1 done: reset released ──", $time);
 
         // test 2 — FIRST DATA BURST  (8 samples)
         // NOTE: in_valid=1 for exactly one fast_clk cycle per sample.
@@ -135,7 +210,7 @@ module my_sys_tb;
         // FIR output appears 2 cycles later (pipeline) and winc=fir_valid
         // pushes each result into the FIFO.
         // UART starts draining the FIFO as soon as the first word is there.
-        $display("[%0t ns] ── test 2 start: streaming block 1 ──", $time);
+        $display("[%t] ── test 2 start: streaming block 1 ──", $time);
 
         for (i = 0; i < 8; i = i + 1) begin
             @(posedge fast_clk); #2;
@@ -147,7 +222,7 @@ module my_sys_tb;
         in_valid = 1'b0;
         data_in  = 8'd0;
 
-        $display("[%0t ns] ── test 2 done: 8 samples sent ──", $time);
+        $display("[%t] ── test 2 done: 8 samples sent ──", $time);
 
         // test 3 — IDLE  (trigger clock gating)
         // Keep in_valid=0 for 15 fast_clk cycles.
@@ -162,16 +237,16 @@ module my_sys_tb;
 
         repeat (15) @(posedge fast_clk);
 
-        $display("[%0t ns] ── test 3: after 15 idle cycles, clk_en = %b (expect 0) ──",
+        $display("[%t] ── test 3: after 15 idle cycles, clk_en = %b (expect 0) ──",
                  $time, dut.clk_en);
 
         // sanity check: report if gating did not trigger
         if (dut.clk_en !== 1'b0)
-            $display("[%0t ns]  WARNING: clk_en expected 0, got %b", $time, dut.clk_en);
+            $display("[%t]  WARNING: clk_en expected 0, got %b", $time, dut.clk_en);
 
         // test 4 — wakeup  (second data burst)
         // The first in_valid=1 should immediately re-enable clk_en.
-        $display("[%0t ns] ── test 4 start: streaming block 2 (wakeup test) ──", $time);
+        $display("[%t] ── test 4 start: streaming block 2 (wakeup test) ──", $time);
 
         for (i = 0; i < 8; i = i + 1) begin
             @(posedge fast_clk); #2;
@@ -181,23 +256,23 @@ module my_sys_tb;
         @(posedge fast_clk); #2;
         in_valid = 1'b0;
 
-        $display("[%0t ns] ── test 4 done: clk_en = %b (expect 1) ──",
+        $display("[%t] ── test 4 done: clk_en = %b (expect 1) ──",
                  $time, dut.clk_en);
 
         if (dut.clk_en !== 1'b1)
-            $display("[%0t ns]  WARNING: clk_en expected 1, got %b", $time, dut.clk_en);
+            $display("[%t]  WARNING: clk_en expected 1, got %b", $time, dut.clk_en);
 
         // test 5 — DRAIN  (wait for UART to send all queued words)
         // Two bursts × 8 words × 18 bit-times @ 9600 baud:
         //   2 × 8 × (1/9600) × 18 = 30 ms; add 2 ms margin → 32 ms.
         // The VCD file will capture all toggle activity across this window,
         // including the idle (gated) period for power comparison.
-        $display("[%0t ns] ── test 5: waiting 32 ms for UART drain... ──", $time);
+        $display("[%t] ── test 5: waiting 32 ms for UART drain... ──", $time);
         #32_000_000;   // 32,000,000 ns = 32 ms
 
         // test 6 — DONE
-        $display("[%0t ns] ── Simulation complete ──", $time);
-        $display("Check simulation_dump.vcd in GTKWave or Quartus Power Analyzer.");
+        $display("[%t] ── Simulation complete ──", $time);
+        print_activity;
         $finish;
     end
 
@@ -209,7 +284,7 @@ module my_sys_tb;
         forever begin
             @(posedge fast_clk);
             if (dut.fifo_wfull)
-                $display("[%0t ns]  WARNING: FIFO FULL — data may be lost!", $time);
+                $display("[%t]  WARNING: FIFO FULL — data may be lost!", $time);
         end
     end
 

@@ -16,7 +16,7 @@
 cd [file dirname [info script]]
 vlib work
 vlog +define+SIMULATION ../rtl/my_sys.v ../rtl/fir.v ../rtl/afifo.v ../rtl/uart.v ../rtl/power_ctrl.v ../tb/my_sys_tb.v
-vsim -voptargs=+acc work.my_sys_tb
+vsim -voptargs=+acc work.my_sys_tb +vcd
 
 # >>> THE KEY LINE: hold clk_en = 1 for the entire simulation (no gating) <<<
 force -freeze sim:/my_sys_tb/dut/clk_en 1 0
