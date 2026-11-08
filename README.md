@@ -48,24 +48,27 @@ Results (Quartus Prime Lite 25.1std, Slow 1200 mV 85 °C model; full report in `
 The Unconstrained Paths report shows zero unconstrained endpoints. The critical path is the FIR shift-and-add datapath. The Fmax value is derived as 1 / (10 − 3.77 ns), not read from the Fmax report.
 ## Verification
 
-`tb/my_sys_tb.v` drives two independent clocks (100 MHz and 10 MHz, deliberately phase-offset) through five phases:
+`tb/my_sys_tb.v` is self-checking. It drives two independent clocks (100 MHz and 10 MHz, deliberately phase-offset) through:
 1. Reset.
 2. An 8-sample burst.
-3. An idle period long enough to trigger clock gating.
-4. A wake-up burst.
-5. A UART drain.
+3. An idle period long enough to trigger clock gating (checks `clk_en` drops).
+4. A wait until the FIFO has drained, then a wake-up burst (checks `clk_en` rises).
+5. A drain: wait until every predicted word has arrived and the UART is idle, with a timeout.
 
-**Current status:** directed stimulus with waveform and log inspection. Self-checking (UART frame decoder → FIR reference model → scoreboard with PASS/FAIL counts) is in progress.
+Testbench structure:
+- **Reference model:** samples `in_valid`/`data_in` at the DUT pins on the raw `fast_clk` and pushes the expected FIR output into a queue.
+- **Output monitor:** a UART receiver model that decodes frames from `tx` by sampling mid-bit and checks start and stop bits.
+- **Scoreboard:** pops the oldest prediction for each received frame and compares, so wrong values, missing, extra, duplicated and reordered words all fail. Predictions left over at the end are reported as missing frames. The test passes only with zero failures *and* at least one check.
+
+**Result:** `./run_tests.sh` → `ALL 2 RUNS PASSED`. 18/18 checks with clock gating (16 frames + 2 `clk_en` checks), 17/17 with `+nogating` (the idle-gating check is skipped).
 
 **Finding: async FIFO full-flag bug (fixed).** A UART receiver model added to the testbench decoded 15 frames where 8 were expected: 7 words of burst 2, then burst 1's last word, then the same 7 words again. Burst 1's first 7 results were gone.
 
 The cause was `wfull` in `rtl/afifo.v`. It compared the Gray-coded write pointer against the synchronized read pointer with only the MSB inverted, which is the full test for *binary* pointers. For Gray pointers, being exactly one lap ahead flips the top **two** bits (e.g. gray(0) = `0000`, gray(8) = `1100`). With the wrong test the FIFO never reported full, so write #9 overwrote unread data, and the read side then read past valid entries and sent words twice. After the one-bit fix, the decoder receives exactly the eight expected block-1 results (`000a 0028 0064 00c8 012c 0190 01f4 0258`). The original testbench only printed `tx` edges, so the bug had passed simulation and synthesis unnoticed.
 
-**Current result: burst 2 is lost (stimulus, not RTL).** The testbench is now self-checking: a reference model of the FIR predicts every output, and a scoreboard compares each decoded UART frame against it, in order. Result with the original stimulus: 8/8 burst-1 frames match, and all 8 burst-2 frames are reported missing, with or without clock gating. Burst 2 arrives ~150 ns after burst 1, before the UART has taken a single word, so the FIFO is genuinely full and the writes are correctly refused (the design has no back-pressure). The stimulus needs to wait for the FIFO to drain before burst 2.
+**Finding: original stimulus overflowed the FIFO.** With the scoreboard in, the original test reported all 8 burst-2 words missing, with or without clock gating. Burst 2 started ~150 ns after burst 1, before the UART had taken a single word, so the FIFO was genuinely full and the writes were refused (the design has no back-pressure). The stimulus now waits for the FIFO to drain before burst 2.
 
-**Open question that this exposes:** the write side's copy of the read pointer is synchronized on `gated_clk`. While the clock is gated it stops updating, so after a wake-up `wfull` can briefly be high on stale information. Whether that costs the first word after wake-up is what the fixed stimulus will show.
-
-> TODO: once the scoreboard is in, record the result here (checks / pass / fail), say how the stimulus was changed, and say whether the first sample after clock wake-up is captured.
+**Finding: stale full flag while the clock is gated.** The write side's copy of the read pointer is synchronized on `gated_clk`, so it stops updating while the clock is gated. In the gating run, `wfull` is set at 205 ns when burst 1 fills the FIFO and stays set for the whole ~13 ms idle period, even though the UART empties the FIFO during that time. It clears 25 ns after burst 2 starts, once the synchronizer has seen two `gated_clk` edges, which is before the FIR's first output (two edges of pipeline latency) reaches the FIFO. The first word after wake-up (`0357`) arrives correctly, so no data is lost. The design is safe only because the FIR latency is at least as long as the synchronizer depth: a shorter pipeline, or a deeper synchronizer, would risk dropping the first word. Clocking the write-side synchronizer from the ungated `fast_clk` would remove that dependency.
 
 ## Results
 
@@ -87,12 +90,10 @@ Clock-gating benefit, measured as switching activity in simulation. Dynamic powe
 
 | Run | `fast_clk` edges | `gated_clk` edges | Fast-domain clock activity |
 |---|---|---|---|
-| Gating on | 3,200,033 | 37 | 0.0012 % |
-| Gating off (`+nogating`) | 3,200,033 | 3,200,033 | 100 % |
+| Gating on | 3,002,039 | 37 | 0.0012 % |
+| Gating off (`+nogating`) | 3,002,039 | 3,002,039 | 100 % |
 
-The fast domain's clock runs only while samples are arriving plus the 10-cycle idle timeout. Through the ~32 ms UART drain it is stopped. The saving is in the clock network: the FIR and FIFO data registers already hold their value when idle because of their enables. The saving grows with the fraction of time the input is idle.
-
-> TODO: re-run `./run_tests.sh` after the stimulus fix and update the numbers above.
+The fast domain's clock runs only while samples are arriving plus the 10-cycle idle timeout. Through the ~30 ms of UART transmission it is stopped. The saving is in the clock network: the FIR and FIFO data registers already hold their value when idle because of their enables. The saving grows with the fraction of time the input is idle.
 
 No milliwatt figure is given. That needs a VCD-driven Power Analyzer run in Quartus (`sim/run_sim.do` vs `sim/run_sim_nogating.do`, import each `simulation_dump.vcd`), which wasn't done. `report.pdf` contains an earlier *vectorless* estimate: 9.80 mW core dynamic at the default 12.5 % toggle rate vs. 9.65 mW at 1 %. That estimate lowers activity on every net instead of stopping `gated_clk`, so it doesn't isolate the effect of clock gating.
 

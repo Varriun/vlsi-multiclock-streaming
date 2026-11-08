@@ -287,6 +287,8 @@ module my_sys_tb;
             end
         end
 
+        wait(dut.fifo_empty);
+        
         // test 4 — wakeup  (second data burst)
         // The first in_valid=1 should immediately re-enable clk_en.
         $display("[%t] ── test 4 start: streaming block 2 (wakeup test) ──", $time);
@@ -349,15 +351,21 @@ module my_sys_tb;
         $finish;
     end
 
-    // Overflow watchdog
-    // Alert if the FIFO fills up — this would mean the FIR is producing data
-    // faster than the UART can drain it during continuous streaming.
-    // At these test rates it should never trigger.
+    // Full-flag monitor
+    // Reports each change of wfull instead of every cycle it is high.
+    // Note: wfull is computed from a read pointer synchronized on gated_clk.
+    // While the fast clock is gated, that copy stops updating, so wfull can
+    // stay high for the whole idle period even after the UART has emptied
+    // the FIFO. It catches up within 2 gated_clk edges after wake-up.
+    // Writes while wfull is high are dropped (no back-pressure); the
+    // scoreboard reports any such loss as missing frames.
     initial begin
         forever begin
-            @(posedge fast_clk);
-            if (dut.fifo_wfull)
-                $display("[%t]  WARNING: FIFO FULL — data may be lost!", $time);
+            @(dut.fifo_wfull);
+            if (dut.fifo_wfull === 1'b1)
+                $display("[%t]  NOTE: FIFO full flag set", $time);
+            else
+                $display("[%t]  NOTE: FIFO full flag cleared", $time);
         end
     end
 
