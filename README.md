@@ -57,7 +57,13 @@ The Unconstrained Paths report shows zero unconstrained endpoints. The critical 
 
 **Current status:** directed stimulus with waveform and log inspection. Self-checking (UART frame decoder → FIR reference model → scoreboard with PASS/FAIL counts) is in progress.
 
-**Finding: FIFO overflow in the original test.** The wake-up burst arrives ~150 ns after the first burst, while the FIFO still holds all 8 words of burst 1 (draining takes ~15 ms). `wfull` stays high for the whole second burst, and about 7 of its 8 results are dropped. The testbench's original comment claimed overflow "should never trigger". It does, and only a check on the received data would catch it.
+**Finding: async FIFO full-flag bug (fixed).** A UART receiver model added to the testbench decoded 15 frames where 8 were expected: 7 words of burst 2, then burst 1's last word, then the same 7 words again. Burst 1's first 7 results were gone.
+
+The cause was `wfull` in `rtl/afifo.v`. It compared the Gray-coded write pointer against the synchronized read pointer with only the MSB inverted, which is the full test for *binary* pointers. For Gray pointers, being exactly one lap ahead flips the top **two** bits (e.g. gray(0) = `0000`, gray(8) = `1100`). With the wrong test the FIFO never reported full, so write #9 overwrote unread data, and the read side then read past valid entries and sent words twice. After the one-bit fix, the decoder receives exactly the eight expected block-1 results (`000a 0028 0064 00c8 012c 0190 01f4 0258`). The original testbench only printed `tx` edges, so the bug had passed simulation and synthesis unnoticed.
+
+**Current result: burst 2 is lost (stimulus, not RTL).** The testbench is now self-checking: a reference model of the FIR predicts every output, and a scoreboard compares each decoded UART frame against it, in order. Result with the original stimulus: 8/8 burst-1 frames match, and all 8 burst-2 frames are reported missing, with or without clock gating. Burst 2 arrives ~150 ns after burst 1, before the UART has taken a single word, so the FIFO is genuinely full and the writes are correctly refused (the design has no back-pressure). The stimulus needs to wait for the FIFO to drain before burst 2.
+
+**Open question that this exposes:** the write side's copy of the read pointer is synchronized on `gated_clk`. While the clock is gated it stops updating, so after a wake-up `wfull` can briefly be high on stale information. Whether that costs the first word after wake-up is what the fixed stimulus will show.
 
 > TODO: once the scoreboard is in, record the result here (checks / pass / fail), say how the stimulus was changed, and say whether the first sample after clock wake-up is captured.
 

@@ -112,6 +112,27 @@ module my_sys_tb;
         end
     endtask
 
+    reg [7:0]   his      [3:0];
+    reg [15:0]  exp_next;
+    reg [15:0]  exp_q    [$];
+    integer     passes      = 0;
+    integer     fails       = 0;
+    always @(posedge fast_clk or negedge rst_n) begin 
+        if(!rst_n) begin 
+            for (integer i=0;i<4;i++) begin
+                his[i] = 8'b0;
+            end
+        end else if(in_valid) begin 
+            for (integer i=3;i>0;i--) begin
+                his[i] = his[i-1];
+            end
+            his[0]  =   data_in;
+            exp_next = (1*his[0])+(2*his[1])+(3*his[2])+(4*his[3]);
+            exp_q.push_back(exp_next);
+            $display("[%t] MODEL expected: %h",$time,exp_next);
+        end
+    end 
+
     // tx serial output monitor
     // watches the tx line and prints a message on every edge.
     // this lets you verify 9600-baud framing in the transcript.
@@ -132,9 +153,12 @@ module my_sys_tb;
 
     // UART receiver model (testbench only)
     localparam integer BIT_NS = 1042 * 100;   // one bit-time in ns
-
-    reg [15:0] rx_word;
-    integer    b;
+    // end-of-test drain: 16 frames x 18 bits x 104.2 us = 30 ms, plus margin
+    localparam integer DRAIN_TIMEOUT_NS = 40_000_000;
+    localparam integer POLL_NS          = 10_000;     // check every 10 us
+    reg [15:0]  exp_word;
+    reg [15:0]  rx_word;
+    integer     b;
 
     initial begin
         forever begin
@@ -157,14 +181,25 @@ module my_sys_tb;
                 // rx_word[b] = ...    ← what's on the wire right now?
                 rx_word[b] = tx; 
             end
-
             // 5. wait one more bit and check the stop bit is 1; warn if not
             #(BIT_NS);
             if(tx==0) begin
                 $display("[%t] Warning: stop bit is not 1", $time);
             end
-            // 6. print rx_word in hex, with the time
-            $display("[%t] Displayed message %h",$time, rx_word);
+            // 6. Prints the recieved data on burst and comapres with expected, verified data will be accounted as PASS
+            if(exp_q.size()==0) begin 
+                fails = fails+1;
+                $display("[%t] FAIL unexpected frame %h (no predictions left)",$time, rx_word);
+            end else begin 
+                exp_word = exp_q.pop_front();
+                if (rx_word === exp_word) begin 
+                    passes = passes+1;
+                    $display("[%t] PASS got %h",$time, rx_word);
+                end else begin 
+                    fails = fails+1;
+                    $display("[%t] FAIL got %h. Expected %h",$time, rx_word, exp_word);
+                end
+            end
         end
     end
 
@@ -240,9 +275,17 @@ module my_sys_tb;
         $display("[%t] ── test 3: after 15 idle cycles, clk_en = %b (expect 0) ──",
                  $time, dut.clk_en);
 
-        // sanity check: report if gating did not trigger
-        if (dut.clk_en !== 1'b0)
-            $display("[%t]  WARNING: clk_en expected 0, got %b", $time, dut.clk_en);
+        // check: gating must have triggered (skipped under +nogating, where
+        // clk_en is forced high on purpose)
+        if (!$test$plusargs("nogating")) begin
+            if (dut.clk_en === 1'b0) begin
+                passes = passes + 1;
+                $display("[%t] PASS clk_en low after idle", $time);
+            end else begin
+                fails = fails + 1;
+                $display("[%t] FAIL clk_en expected 0 after idle, got %b", $time, dut.clk_en);
+            end
+        end
 
         // test 4 — wakeup  (second data burst)
         // The first in_valid=1 should immediately re-enable clk_en.
@@ -259,20 +302,50 @@ module my_sys_tb;
         $display("[%t] ── test 4 done: clk_en = %b (expect 1) ──",
                  $time, dut.clk_en);
 
-        if (dut.clk_en !== 1'b1)
-            $display("[%t]  WARNING: clk_en expected 1, got %b", $time, dut.clk_en);
+        // check: the clock must be running again after wake-up
+        if (dut.clk_en === 1'b1) begin
+            passes = passes + 1;
+            $display("[%t] PASS clk_en high after wake-up", $time);
+        end else begin
+            fails = fails + 1;
+            $display("[%t] FAIL clk_en expected 1 after wake-up, got %b", $time, dut.clk_en);
+        end
 
-        // test 5 — DRAIN  (wait for UART to send all queued words)
-        // Two bursts × 8 words × 18 bit-times @ 9600 baud:
-        //   2 × 8 × (1/9600) × 18 = 30 ms; add 2 ms margin → 32 ms.
-        // The VCD file will capture all toggle activity across this window,
-        // including the idle (gated) period for power comparison.
-        $display("[%t] ── test 5: waiting 32 ms for UART drain... ──", $time);
-        #32_000_000;   // 32,000,000 ns = 32 ms
+        // test 5 — DRAIN
+        // Wait until the UART has delivered everything: no predictions left,
+        // nothing left in the FIFO, and the UART idle. If frames were lost,
+        // predictions never run out, so a timeout ends the wait instead.
+        // (tx_busy drops for one slow_clk cycle between back-to-back frames;
+        //  the fifo_empty term keeps that gap from ending the wait early.)
+        $display("[%t] ── test 5: draining UART (timeout %0d ms) ──",
+                 $time, DRAIN_TIMEOUT_NS / 1_000_000);
+        begin : drain
+            integer waited;
+            waited = 0;
+            while ((exp_q.size() != 0 || !dut.fifo_empty || tx_busy)
+                   && waited < DRAIN_TIMEOUT_NS) begin
+                #(POLL_NS);
+                waited = waited + POLL_NS;
+            end
+            if (waited >= DRAIN_TIMEOUT_NS)
+                $display("[%t] drain timeout: %0d prediction(s) never arrived",
+                         $time, exp_q.size());
+        end
 
-        // test 6 — DONE
+        // test 6 — END-OF-TEST CHECKS AND VERDICT
+        // Every prediction still queued is a frame the DUT never sent.
+        while (exp_q.size() > 0) begin
+            fails = fails + 1;
+            $display("[%t] FAIL missing frame: expected %h never received",
+                     $time, exp_q.pop_front());
+        end
+
         $display("[%t] ── Simulation complete ──", $time);
         print_activity;
+        $display("CHECKS: %0d   PASS: %0d   FAIL: %0d", passes + fails, passes, fails);
+        // "0 fails out of 0 checks" must not count as a pass
+        if (fails == 0 && passes > 0) $display("TEST PASSED");
+        else                          $display("TEST FAILED");
         $finish;
     end
 

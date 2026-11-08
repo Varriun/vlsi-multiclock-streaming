@@ -38,7 +38,7 @@ for r in "${ORDER[@]}"; do
   # shellcheck disable=SC2086
   ( cd "$BUILD/$r" && vvp -n ../my_sys_tb.vvp ${RUNS[$r]} "${EXTRA[@]}" > sim.log 2>&1 )
   log="$BUILD/$r/sim.log"
-  grep -E '  FAIL|WARNING|CHECKS|ACTIVITY|TEST (PASSED|FAILED)' "$log"
+  grep -E '(^|] )FAIL|WARNING|CHECKS|ACTIVITY|TEST (PASSED|FAILED)' "$log"
   if ! grep -q 'TEST PASSED' "$log" || grep -q 'TEST FAILED' "$log"; then
     failed+=("$r")
   fi
